@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 from .config import config
+from .filesystem_tools import register_filesystem_tools
 from .indexer import app as indexer_app
 from .query import query_codebase
 from .shared import SQLITE_DB
@@ -24,8 +25,16 @@ mcp = FastMCP(
         "Provides semantic search that understands meaning --"
         " unlike grep or text matching,"
         " it finds relevant code even when exact keywords are unknown."
+        "\n\n"
+        "Also provides fast filesystem tools:"
+        "\n- find_files: fast glob-based file discovery"
+        "\n- read_file: read file contents with line ranges"
+        "\n- grep_code: regex text search across files"
+        "\n- directory_tree: list project structure"
     ),
 )
+
+register_filesystem_tools(mcp)
 
 # Lock to prevent concurrent index updates
 _index_lock = asyncio.Lock()
