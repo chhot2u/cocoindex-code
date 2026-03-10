@@ -39,9 +39,14 @@ mcp = FastMCP(
         "\n- sequential_thinking: step-by-step problem solving with branching"
         "\n- extended_thinking: deep analysis with automatic checkpoints"
         "\n- ultra_thinking: maximum-depth reasoning with hypothesis verification"
+        "\n- evidence_tracker: attach weighted evidence to ultra_thinking hypotheses"
+        "\n- premortem: structured pre-failure risk analysis"
+        "\n- inversion_thinking: guarantee-failure-then-invert reasoning"
+        "\n- effort_estimator: three-point PERT estimation with confidence intervals"
         "\n- learning_loop: reflect on sessions and extract learnings"
         "\n- self_improve: get strategy recommendations from past performance"
         "\n- reward_thinking: provide reinforcement signals for thinking sessions"
+        "\n\nAll new tools support effort_mode: 'low', 'medium', 'high'"
     ),
 )
 
