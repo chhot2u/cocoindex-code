@@ -124,7 +124,7 @@ class RewardResult(BaseModel):
 
 # --- Shared constants ---
 
-VALID_EFFORT_MODES: frozenset[str] = frozenset({"low", "medium", "high"})
+VALID_EFFORT_MODES: frozenset[str] = frozenset({"low", "medium", "high", "ultra"})
 
 VALID_EVIDENCE_TYPES: frozenset[str] = frozenset(
     {"code_ref", "data_point", "external", "assumption", "test_result"}
@@ -137,6 +137,42 @@ VALID_PREMORTEM_PHASES: frozenset[str] = frozenset(
 VALID_INVERSION_PHASES: frozenset[str] = frozenset(
     {"define_goal", "invert", "list_failure_causes", "rank_causes", "reinvert", "action_plan"}
 )
+
+VALID_PLAN_OPTIMIZER_PHASES: frozenset[str] = frozenset(
+    {
+        "submit_plan", "analyze", "detect_anti_patterns",
+        "add_variant", "score_variant", "recommend",
+    }
+)
+
+PLAN_DIMENSIONS: tuple[str, ...] = (
+    "clarity", "completeness", "correctness", "risk",
+    "simplicity", "testability", "edge_cases", "actionability",
+)
+
+# Anti-pattern detection patterns
+_VAGUE_PATTERNS: list[str] = [
+    r"\bmake it work\b",
+    r"\bfix it\b",
+    r"\bclean up\b",
+    r"\bimprove\b(?!ment)",
+    r"\bjust do\b",
+    r"\bsomehow\b",
+    r"\betc\.?\b",
+    r"\bstuff\b",
+    r"\bthings\b",
+    r"\bhandle it\b",
+    r"\bfigure out\b",
+    r"\bwhatever\b",
+]
+
+_MISSING_CONCERN_CHECKS: dict[str, list[str]] = {
+    "testing": ["test", "verify", "assert", "validate", "spec"],
+    "error_handling": ["error", "exception", "fail", "catch", "handle"],
+    "edge_cases": ["edge case", "corner case", "empty", "null", "none", "zero", "boundary"],
+    "security": ["auth", "permission", "sanitize", "escape", "inject"],
+    "performance": ["performance", "scale", "cache", "optimize", "latency", "throughput"],
+}
 
 
 # --- Evidence Tracker models ---
@@ -261,6 +297,9 @@ class EstimateItem(BaseModel):
     confidence_68_high: float = 0.0
     confidence_95_low: float = 0.0
     confidence_95_high: float = 0.0
+    confidence_99_low: float = 0.0
+    confidence_99_high: float = 0.0
+    risk_buffer: float = 0.0
 
 
 class EstimatorSession(BaseModel):
@@ -282,6 +321,97 @@ class EffortEstimatorResult(BaseModel):
     total_confidence_68_high: float = 0.0
     total_confidence_95_low: float = 0.0
     total_confidence_95_high: float = 0.0
+    total_confidence_99_low: float = 0.0
+    total_confidence_99_high: float = 0.0
+    total_risk_buffer: float = 0.0
+    effort_mode: str = "medium"
+    message: str | None = None
+
+
+# --- Plan Optimizer models ---
+
+
+class PlanAntiPattern(BaseModel):
+    """An anti-pattern detected in a plan."""
+
+    pattern_type: str = Field(
+        description="Type: vague_language, missing_testing, "
+        "missing_error_handling, missing_edge_cases, god_step, "
+        "no_structure, todo_marker, missing_security, "
+        "missing_performance"
+    )
+    description: str = Field(description="What was detected")
+    severity: str = Field(
+        default="medium",
+        description="Severity: low, medium, high",
+    )
+    location: str = Field(
+        default="",
+        description="Where in the plan this was found",
+    )
+
+
+class PlanVariant(BaseModel):
+    """A plan variant with scores."""
+
+    label: str = Field(description="Variant label: A, B, or C")
+    name: str = Field(
+        description="Variant name, e.g. 'Minimal & Pragmatic'",
+    )
+    summary: str = Field(description="Brief approach summary")
+    approach: str = Field(
+        default="", description="Full variant approach text",
+    )
+    pros: list[str] = Field(default_factory=list)
+    cons: list[str] = Field(default_factory=list)
+    risk_level: str = Field(default="medium")
+    complexity: str = Field(default="medium")
+    scores: dict[str, float] = Field(
+        default_factory=dict,
+        description="Dimension scores (0.0-10.0)",
+    )
+    total: float = Field(default=0.0, description="Sum of all scores")
+
+
+class PlanOptimizerSession(BaseModel):
+    """Internal state for a plan_optimizer session."""
+
+    plan_text: str = ""
+    plan_context: str = ""
+    analysis_scores: dict[str, float] = Field(default_factory=dict)
+    analysis_issues: list[str] = Field(default_factory=list)
+    anti_patterns: list[PlanAntiPattern] = Field(default_factory=list)
+    variants: list[PlanVariant] = Field(default_factory=list)
+    recommendation: str = ""
+    winner_label: str = ""
+
+
+class PlanOptimizerResult(BaseModel):
+    """Result from the plan_optimizer tool."""
+
+    success: bool
+    session_id: str = ""
+    phase: str = ""
+    plan_text: str = ""
+    plan_context: str = ""
+    analysis_scores: dict[str, float] = Field(default_factory=dict)
+    analysis_issues: list[str] = Field(default_factory=list)
+    anti_patterns: list[PlanAntiPattern] = Field(default_factory=list)
+    anti_pattern_count: int = 0
+    plan_health_score: float = Field(
+        default=0.0,
+        description="Overall plan health 0-100 based on analysis",
+    )
+    variants: list[PlanVariant] = Field(default_factory=list)
+    comparison_matrix: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description="Dimension -> {variant_label: score}",
+    )
+    recommendation: str = ""
+    winner_label: str = ""
+    thought_number: int = 0
+    total_thoughts: int = 0
+    next_thought_needed: bool = True
     effort_mode: str = "medium"
     message: str | None = None
 
@@ -299,6 +429,7 @@ class ThinkingEngine:
         self._premortems: dict[str, PremortemSession] = {}
         self._inversions: dict[str, InversionSession] = {}
         self._estimators: dict[str, EstimatorSession] = {}
+        self._plan_optimizers: dict[str, PlanOptimizerSession] = {}
         self._load_memory()
 
     @property
@@ -592,10 +723,14 @@ class ThinkingEngine:
                 ),
             )
 
+        clamped_strength = max(0.0, min(1.0, strength))
+        # Ultra mode: auto-boost strength for strongest evidence types
+        if effort_mode == "ultra" and evidence_type in ("code_ref", "test_result"):
+            clamped_strength = max(clamped_strength, 0.9)
         item = EvidenceItem(
             text=text,
             evidence_type=evidence_type if effort_mode != "low" else "data_point",
-            strength=max(0.0, min(1.0, strength)),
+            strength=clamped_strength,
             added_at=time.time(),
         )
 
@@ -753,6 +888,11 @@ class ThinkingEngine:
                 risk_score=clamped_likelihood * clamped_impact,
             )
             pm.risks.append(risk)
+            # Ultra mode: auto-rank risks at every phase
+            ranked = (
+                sorted(pm.risks, key=lambda r: r.risk_score, reverse=True)
+                if effort_mode == "ultra" else []
+            )
             return PremortemResult(
                 success=True,
                 session_id=session_id,
@@ -760,6 +900,7 @@ class ThinkingEngine:
                 plan_description=pm.plan,
                 failure_scenario=pm.failure_scenario,
                 risks=list(pm.risks),
+                ranked_risks=ranked if ranked else [],
                 thought_number=data.thought_number,
                 total_thoughts=data.total_thoughts,
                 next_thought_needed=data.next_thought_needed,
@@ -805,6 +946,14 @@ class ThinkingEngine:
         if mitigation is not None:
             pm.risks[risk_index].mitigation = mitigation
         mitigations_count = sum(1 for r in pm.risks if r.mitigation)
+        # Ultra mode: warn if not all risks are mitigated
+        ultra_message = None
+        if effort_mode == "ultra" and mitigations_count < len(pm.risks):
+            unmitigated = len(pm.risks) - mitigations_count
+            ultra_message = (
+                f"{unmitigated} risk(s) still lack mitigations."
+                " Ultra mode requires all risks to be mitigated."
+            )
         return PremortemResult(
             success=True,
             session_id=session_id,
@@ -817,6 +966,7 @@ class ThinkingEngine:
             total_thoughts=data.total_thoughts,
             next_thought_needed=data.next_thought_needed,
             effort_mode=effort_mode,
+            message=ultra_message,
         )
 
     # --- Inversion Thinking ---
@@ -989,6 +1139,18 @@ class ThinkingEngine:
             for cause in inv.failure_causes:
                 if cause.inverted_action:
                     inv.action_plan.append(cause.inverted_action)
+        # Ultra mode: auto-reinvert ALL causes that lack inverted_actions,
+        # then auto-populate action plan from ALL of them
+        if effort_mode == "ultra":
+            for cause in inv.failure_causes:
+                if not cause.inverted_action:
+                    cause.inverted_action = (
+                        f"Prevent: {cause.description}"
+                    )
+            if not inv.action_plan:
+                for cause in inv.failure_causes:
+                    if cause.inverted_action:
+                        inv.action_plan.append(cause.inverted_action)
         return InversionThinkingResult(
             success=True,
             session_id=session_id,
@@ -1023,6 +1185,9 @@ class ThinkingEngine:
             confidence_68_high=pert + std_dev,
             confidence_95_low=pert - 2 * std_dev,
             confidence_95_high=pert + 2 * std_dev,
+            confidence_99_low=pert - 3 * std_dev,
+            confidence_99_high=pert + 3 * std_dev,
+            risk_buffer=pessimistic * 1.5,
         )
 
     def process_estimate(
@@ -1100,6 +1265,7 @@ class ThinkingEngine:
             else 0.0
         )
 
+        is_advanced = effort_mode in ("high", "ultra")
         return EffortEstimatorResult(
             success=True,
             session_id=session_id,
@@ -1107,16 +1273,410 @@ class ThinkingEngine:
             estimates=list(est.estimates),
             total_pert=total_pert,
             total_std_dev=total_std_dev,
-            total_confidence_68_low=total_pert - total_std_dev if effort_mode != "low" else 0.0,
-            total_confidence_68_high=total_pert + total_std_dev if effort_mode != "low" else 0.0,
+            total_confidence_68_low=(
+                total_pert - total_std_dev
+                if effort_mode != "low" else 0.0
+            ),
+            total_confidence_68_high=(
+                total_pert + total_std_dev
+                if effort_mode != "low" else 0.0
+            ),
             total_confidence_95_low=(
-                total_pert - 2 * total_std_dev if effort_mode == "high" else 0.0
+                total_pert - 2 * total_std_dev
+                if is_advanced else 0.0
             ),
             total_confidence_95_high=(
-                total_pert + 2 * total_std_dev if effort_mode == "high" else 0.0
+                total_pert + 2 * total_std_dev
+                if is_advanced else 0.0
+            ),
+            total_confidence_99_low=(
+                total_pert - 3 * total_std_dev
+                if effort_mode == "ultra" else 0.0
+            ),
+            total_confidence_99_high=(
+                total_pert + 3 * total_std_dev
+                if effort_mode == "ultra" else 0.0
+            ),
+            total_risk_buffer=(
+                sum(e.risk_buffer for e in est.estimates)
+                if effort_mode == "ultra" else 0.0
             ),
             effort_mode=effort_mode,
         )
+
+    # --- Plan Optimizer ---
+
+    @staticmethod
+    def _detect_anti_patterns(plan_text: str) -> list[PlanAntiPattern]:
+        """Detect anti-patterns in a plan using regex heuristics."""
+        import re
+
+        results: list[PlanAntiPattern] = []
+        plan_lower = plan_text.lower()
+        lines = plan_text.splitlines()
+
+        # 1. Vague language detection
+        for pattern in _VAGUE_PATTERNS:
+            for m in re.finditer(pattern, plan_lower):
+                snippet = plan_lower[
+                    max(0, m.start() - 20):m.end() + 20
+                ].strip()
+                results.append(PlanAntiPattern(
+                    pattern_type="vague_language",
+                    description=f"Vague language detected: "
+                    f"'{m.group()}' in '...{snippet}...'",
+                    severity="medium",
+                    location=f"char {m.start()}",
+                ))
+
+        # 2. Missing concern checks
+        for concern, keywords in _MISSING_CONCERN_CHECKS.items():
+            found = any(kw in plan_lower for kw in keywords)
+            if not found:
+                sev = "high" if concern in (
+                    "testing", "error_handling",
+                ) else "medium"
+                results.append(PlanAntiPattern(
+                    pattern_type=f"missing_{concern}",
+                    description=(
+                        f"Plan does not mention {concern}."
+                        f" Consider adding a step for:"
+                        f" {', '.join(keywords)}"
+                    ),
+                    severity=sev,
+                ))
+
+        # 3. God-step detection (any single line > 500 chars)
+        for i, line in enumerate(lines):
+            if len(line.strip()) > 500:
+                results.append(PlanAntiPattern(
+                    pattern_type="god_step",
+                    description=(
+                        f"Step at line {i + 1} is very long"
+                        f" ({len(line.strip())} chars)."
+                        " Consider breaking into smaller steps."
+                    ),
+                    severity="high",
+                    location=f"line {i + 1}",
+                ))
+
+        # 4. No structure (no numbered steps, bullets, or headers)
+        has_structure = bool(re.search(
+            r"^\s*(?:\d+[.)\-]|[-*•]|#{1,3}\s)",
+            plan_text,
+            re.MULTILINE,
+        ))
+        if not has_structure and len(lines) > 3:
+            results.append(PlanAntiPattern(
+                pattern_type="no_structure",
+                description=(
+                    "Plan lacks numbered steps, bullet points,"
+                    " or section headers. Add structure."
+                ),
+                severity="medium",
+            ))
+
+        # 5. TODO/TBD markers
+        for m in re.finditer(
+            r"\b(TODO|TBD|FIXME|HACK|XXX)\b", plan_text,
+        ):
+            results.append(PlanAntiPattern(
+                pattern_type="todo_marker",
+                description=(
+                    f"Unresolved marker: '{m.group()}'"
+                ),
+                severity="high",
+                location=f"char {m.start()}",
+            ))
+
+        return results
+
+    @staticmethod
+    def _compute_plan_health(
+        analysis_scores: dict[str, float],
+        anti_pattern_count: int,
+    ) -> float:
+        """Compute plan health score 0-100."""
+        if not analysis_scores:
+            return 0.0
+        # Base: average of dimension scores scaled to 100
+        avg = sum(analysis_scores.values()) / len(analysis_scores)
+        base = (avg / 10.0) * 100.0
+        # Penalty: -5 per anti-pattern, floor at 0
+        penalty = anti_pattern_count * 5
+        return max(0.0, round(base - penalty, 1))
+
+    @staticmethod
+    def _build_comparison_matrix(
+        variants: list[PlanVariant],
+    ) -> dict[str, dict[str, float]]:
+        """Build comparison matrix: dimension -> {label: score}."""
+        matrix: dict[str, dict[str, float]] = {}
+        for dim in PLAN_DIMENSIONS:
+            matrix[dim] = {}
+            for var in variants:
+                matrix[dim][var.label] = var.scores.get(dim, 0.0)
+        # Add totals row
+        matrix["TOTAL"] = {
+            var.label: var.total for var in variants
+        }
+        return matrix
+
+    def process_plan_optimizer(
+        self,
+        session_id: str,
+        data: ThoughtData,
+        phase: str = "submit_plan",
+        plan_text: str | None = None,
+        plan_context: str | None = None,
+        dimension: str | None = None,
+        score: float = 0.0,
+        issue: str | None = None,
+        variant_label: str | None = None,
+        variant_name: str | None = None,
+        variant_summary: str | None = None,
+        variant_approach: str | None = None,
+        variant_pros: list[str] | None = None,
+        variant_cons: list[str] | None = None,
+        variant_risk_level: str = "medium",
+        variant_complexity: str = "medium",
+        recommendation: str | None = None,
+        winner_label: str | None = None,
+        effort_mode: str = "medium",
+    ) -> PlanOptimizerResult:
+        """Process a plan_optimizer phase."""
+        if phase not in VALID_PLAN_OPTIMIZER_PHASES:
+            return PlanOptimizerResult(
+                success=False,
+                session_id=session_id,
+                phase=phase,
+                effort_mode=effort_mode,
+                message=(
+                    f"Invalid phase '{phase}'. Must be one of: "
+                    f"{', '.join(sorted(VALID_PLAN_OPTIMIZER_PHASES))}"
+                ),
+            )
+
+        # Track thoughts
+        if session_id not in self._sessions:
+            self._sessions[session_id] = []
+        self._sessions[session_id].append(data)
+
+        # Init session
+        if session_id not in self._plan_optimizers:
+            self._plan_optimizers[session_id] = (
+                PlanOptimizerSession()
+            )
+        po = self._plan_optimizers[session_id]
+
+        def _result(**kwargs: object) -> PlanOptimizerResult:
+            """Build result with common fields."""
+            return PlanOptimizerResult(
+                success=True,
+                session_id=session_id,
+                phase=phase,
+                plan_text=po.plan_text,
+                plan_context=po.plan_context,
+                analysis_scores=dict(po.analysis_scores),
+                analysis_issues=list(po.analysis_issues),
+                anti_patterns=list(po.anti_patterns),
+                anti_pattern_count=len(po.anti_patterns),
+                plan_health_score=self._compute_plan_health(
+                    po.analysis_scores,
+                    len(po.anti_patterns),
+                ),
+                variants=list(po.variants),
+                comparison_matrix=(
+                    self._build_comparison_matrix(po.variants)
+                    if po.variants else {}
+                ),
+                recommendation=po.recommendation,
+                winner_label=po.winner_label,
+                thought_number=data.thought_number,
+                total_thoughts=data.total_thoughts,
+                next_thought_needed=data.next_thought_needed,
+                effort_mode=effort_mode,
+                **kwargs,
+            )
+
+        # --- Phase: submit_plan ---
+        if phase == "submit_plan":
+            if not plan_text:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message="plan_text is required for "
+                    "submit_plan phase",
+                )
+            po.plan_text = plan_text
+            if plan_context:
+                po.plan_context = plan_context
+            # Auto-detect anti-patterns on submit
+            po.anti_patterns = self._detect_anti_patterns(
+                plan_text,
+            )
+            return _result()
+
+        # --- Phase: analyze ---
+        if phase == "analyze":
+            if dimension is not None:
+                dim = dimension.lower()
+                if dim not in PLAN_DIMENSIONS:
+                    return PlanOptimizerResult(
+                        success=False,
+                        session_id=session_id,
+                        phase=phase,
+                        effort_mode=effort_mode,
+                        message=(
+                            f"Invalid dimension '{dimension}'."
+                            f" Must be one of: "
+                            f"{', '.join(PLAN_DIMENSIONS)}"
+                        ),
+                    )
+                clamped = max(0.0, min(10.0, score))
+                po.analysis_scores[dim] = clamped
+            if issue:
+                po.analysis_issues.append(issue)
+            return _result()
+
+        # --- Phase: detect_anti_patterns ---
+        if phase == "detect_anti_patterns":
+            # Re-run detection (useful after plan edits)
+            po.anti_patterns = self._detect_anti_patterns(
+                po.plan_text,
+            )
+            return _result()
+
+        # --- Phase: add_variant ---
+        if phase == "add_variant":
+            if not variant_label:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message="variant_label is required "
+                    "(e.g. 'A', 'B', 'C')",
+                )
+            if not variant_name:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message="variant_name is required",
+                )
+            # Check duplicate label
+            existing = [
+                v for v in po.variants
+                if v.label == variant_label
+            ]
+            if existing:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message=(
+                        f"Variant '{variant_label}' already exists."
+                        " Use score_variant to update scores."
+                    ),
+                )
+            variant = PlanVariant(
+                label=variant_label,
+                name=variant_name or "",
+                summary=variant_summary or "",
+                approach=variant_approach or "",
+                pros=variant_pros or [],
+                cons=variant_cons or [],
+                risk_level=variant_risk_level,
+                complexity=variant_complexity,
+            )
+            po.variants.append(variant)
+            return _result()
+
+        # --- Phase: score_variant ---
+        if phase == "score_variant":
+            if not variant_label:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message="variant_label is required",
+                )
+            target = None
+            for v in po.variants:
+                if v.label == variant_label:
+                    target = v
+                    break
+            if target is None:
+                return PlanOptimizerResult(
+                    success=False,
+                    session_id=session_id,
+                    phase=phase,
+                    effort_mode=effort_mode,
+                    message=(
+                        f"Variant '{variant_label}' not found."
+                        " Call add_variant first."
+                    ),
+                )
+            if dimension is not None:
+                dim = dimension.lower()
+                if dim not in PLAN_DIMENSIONS:
+                    return PlanOptimizerResult(
+                        success=False,
+                        session_id=session_id,
+                        phase=phase,
+                        effort_mode=effort_mode,
+                        message=(
+                            f"Invalid dimension '{dimension}'."
+                            f" Must be one of: "
+                            f"{', '.join(PLAN_DIMENSIONS)}"
+                        ),
+                    )
+                clamped = max(0.0, min(10.0, score))
+                target.scores[dim] = clamped
+                target.total = sum(target.scores.values())
+            return _result()
+
+        # --- Phase: recommend ---
+        # phase == "recommend"
+        # Ultra mode: block recommend if no variants added
+        if effort_mode == "ultra" and not po.variants:
+            return PlanOptimizerResult(
+                success=False,
+                session_id=session_id,
+                phase=phase,
+                effort_mode=effort_mode,
+                message=(
+                    "Ultra mode requires at least one variant"
+                    " before recommending."
+                    " Use add_variant first."
+                ),
+            )
+        # Ultra mode: auto-score unscored dimensions as 0
+        if effort_mode == "ultra":
+            for dim in PLAN_DIMENSIONS:
+                if dim not in po.analysis_scores:
+                    po.analysis_scores[dim] = 0.0
+            for var in po.variants:
+                for dim in PLAN_DIMENSIONS:
+                    if dim not in var.scores:
+                        var.scores[dim] = 0.0
+                var.total = sum(var.scores.values())
+        if recommendation:
+            po.recommendation = recommendation
+        if winner_label:
+            po.winner_label = winner_label
+        # Auto-pick winner by highest total if not specified
+        if not po.winner_label and po.variants:
+            best = max(po.variants, key=lambda v: v.total)
+            po.winner_label = best.label
+        return _result()
+
 
 
 _engine: ThinkingEngine | None = None
@@ -1448,7 +2008,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             " evidence. Evidence types: code_ref, data_point, external,"
             " assumption, test_result. Returns cumulative strength score."
             " Use effort_mode to control depth: low (skip type validation),"
-            " medium (standard), high (full validation)."
+            " medium (standard), high (full validation),"
+            " ultra (full validation + auto-boost strength for code_ref/test_result)."
         ),
     )
     async def evidence_tracker(
@@ -1481,8 +2042,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             description="Strength of this evidence (0.0 to 1.0).",
         ),
         effort_mode: str = Field(
-            default="medium",
-            description="Effort level: 'low', 'medium', or 'high'.",
+            default="ultra",
+            description="Effort level: 'low', 'medium', 'high', or 'ultra'.",
         ),
     ) -> EvidenceTrackerResult:
         try:
@@ -1522,7 +2083,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             " Phases: 'describe_plan', 'imagine_failure', 'identify_causes',"
             " 'rank_risks', 'mitigate'."
             " Use effort_mode to control depth: low (quick risk list),"
-            " medium (full 5-phase flow), high (exhaustive analysis)."
+            " medium (full 5-phase flow), high (exhaustive analysis),"
+            " ultra (auto-rank at every phase + require all mitigations)."
         ),
     )
     async def premortem(
@@ -1584,8 +2146,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             description="Mitigation strategy. Used in 'mitigate' phase.",
         ),
         effort_mode: str = Field(
-            default="medium",
-            description="Effort level: 'low', 'medium', or 'high'.",
+            default="ultra",
+            description="Effort level: 'low', 'medium', 'high', or 'ultra'.",
         ),
     ) -> PremortemResult:
         try:
@@ -1619,7 +2181,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             " 'list_failure_causes', 'rank_causes' (medium/high only),"
             " 'reinvert', 'action_plan'."
             " Use effort_mode: low (skip ranking, 3 phases),"
-            " medium (full 6 phases), high (auto-populate action plan)."
+            " medium (full 6 phases), high (auto-populate action plan),"
+            " ultra (auto-reinvert all causes + auto-populate everything)."
         ),
     )
     async def inversion_thinking(
@@ -1679,8 +2242,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             description="An action item for the plan. Used in 'action_plan' phase.",
         ),
         effort_mode: str = Field(
-            default="medium",
-            description="Effort level: 'low', 'medium', or 'high'.",
+            default="ultra",
+            description="Effort level: 'low', 'medium', 'high', or 'ultra'.",
         ),
     ) -> InversionThinkingResult:
         try:
@@ -1718,7 +2281,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             " Actions: 'add' a task estimate, 'summary' to view all,"
             " 'clear' to reset."
             " Use effort_mode: low (single-point estimate),"
-            " medium (PERT + 68% CI), high (PERT + 68% + 95% CI)."
+            " medium (PERT + 68% CI), high (PERT + 68% + 95% CI),"
+            " ultra (PERT + 68% + 95% + 99.7% CI + risk buffer)."
         ),
     )
     async def effort_estimator(
@@ -1750,8 +2314,8 @@ def register_thinking_tools(mcp: FastMCP) -> None:
             description="Pessimistic (worst-case) estimate.",
         ),
         effort_mode: str = Field(
-            default="medium",
-            description="Effort level: 'low', 'medium', or 'high'.",
+            default="ultra",
+            description="Effort level: 'low', 'medium', 'high', or 'ultra'.",
         ),
     ) -> EffortEstimatorResult:
         try:
@@ -1767,4 +2331,191 @@ def register_thinking_tools(mcp: FastMCP) -> None:
         except Exception as e:
             return EffortEstimatorResult(
                 success=False, message=f"Effort estimator failed: {e!s}"
+            )
+
+    @mcp.tool(
+        name="plan_optimizer",
+        description=(
+            "Structured plan optimization tool."
+            " Analyzes any plan (implementation, architecture, refactoring,"
+            " bug fix) across 8 quality dimensions, auto-detects"
+            " anti-patterns, supports 3 variant generation with"
+            " comparison matrix scoring, and recommends the best approach."
+            "\n\nPhases:"
+            "\n1. 'submit_plan' — Submit plan text + context."
+            "   Auto-detects anti-patterns."
+            "\n2. 'analyze' — Score plan across dimensions"
+            "   (clarity, completeness, correctness, risk, simplicity,"
+            "   testability, edge_cases, actionability)."
+            "   Call once per dimension with score 0-10."
+            "\n3. 'detect_anti_patterns' — Re-run anti-pattern"
+            "   detection (after plan edits)."
+            "\n4. 'add_variant' — Add an alternative plan variant"
+            "   (A=Minimal, B=Robust, C=Optimal Architecture)."
+            "\n5. 'score_variant' — Score a variant across dimensions."
+            "   Call once per dimension per variant."
+            "\n6. 'recommend' — Submit final recommendation."
+            "   Returns full comparison matrix."
+            "\n\nUse effort_mode: low (just submit+analyze, skip variants),"
+            " medium (full 6-phase flow),"
+            " high (full flow + detailed anti-pattern analysis),"
+            " ultra (auto-score missing dimensions + require variants for recommend)."
+        ),
+    )
+    async def plan_optimizer(
+        thought: str = Field(
+            description="The current thinking step content.",
+        ),
+        next_thought_needed: bool = Field(
+            description="Whether another thought step is needed.",
+        ),
+        thought_number: int = Field(
+            ge=1,
+            description="Current thought number in the sequence.",
+        ),
+        total_thoughts: int = Field(
+            ge=1,
+            description="Estimated total thoughts needed.",
+        ),
+        phase: str = Field(
+            default="submit_plan",
+            description=(
+                "Phase: 'submit_plan', 'analyze',"
+                " 'detect_anti_patterns', 'add_variant',"
+                " 'score_variant', or 'recommend'."
+            ),
+        ),
+        session_id: str | None = Field(
+            default=None,
+            description=(
+                "Session identifier."
+                " Auto-generated if not provided."
+            ),
+        ),
+        plan_text: str | None = Field(
+            default=None,
+            description=(
+                "The full plan text to optimize."
+                " Required in 'submit_plan' phase."
+            ),
+        ),
+        plan_context: str | None = Field(
+            default=None,
+            description=(
+                "Context about what the plan is for."
+                " E.g. 'Implementing user authentication'"
+            ),
+        ),
+        dimension: str | None = Field(
+            default=None,
+            description=(
+                "Dimension to score: clarity, completeness,"
+                " correctness, risk, simplicity, testability,"
+                " edge_cases, actionability."
+                " Used in 'analyze' and 'score_variant' phases."
+            ),
+        ),
+        score: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=10.0,
+            description="Score for the dimension (0.0-10.0).",
+        ),
+        issue: str | None = Field(
+            default=None,
+            description=(
+                "An issue found during analysis."
+                " Used in 'analyze' phase."
+            ),
+        ),
+        variant_label: str | None = Field(
+            default=None,
+            description=(
+                "Variant label: 'A', 'B', or 'C'."
+                " Used in 'add_variant' and 'score_variant'."
+            ),
+        ),
+        variant_name: str | None = Field(
+            default=None,
+            description=(
+                "Variant name, e.g. 'Minimal & Pragmatic'."
+                " Used in 'add_variant'."
+            ),
+        ),
+        variant_summary: str | None = Field(
+            default=None,
+            description="Brief approach summary for the variant.",
+        ),
+        variant_approach: str | None = Field(
+            default=None,
+            description="Full variant approach text.",
+        ),
+        variant_pros: list[str] | None = Field(
+            default=None,
+            description="List of pros for this variant.",
+        ),
+        variant_cons: list[str] | None = Field(
+            default=None,
+            description="List of cons for this variant.",
+        ),
+        variant_risk_level: str = Field(
+            default="medium",
+            description="Risk level: 'low', 'medium', 'high'.",
+        ),
+        variant_complexity: str = Field(
+            default="medium",
+            description="Complexity: 'low', 'medium', 'high'.",
+        ),
+        recommendation: str | None = Field(
+            default=None,
+            description=(
+                "Final recommendation text."
+                " Used in 'recommend' phase."
+            ),
+        ),
+        winner_label: str | None = Field(
+            default=None,
+            description=(
+                "Label of the winning variant."
+                " Auto-selected if not provided."
+            ),
+        ),
+        effort_mode: str = Field(
+            default="ultra",
+            description="Effort level: 'low', 'medium', 'high', or 'ultra'.",
+        ),
+    ) -> PlanOptimizerResult:
+        try:
+            engine = _get_engine()
+            sid = session_id or str(uuid.uuid4())
+            data = ThoughtData(
+                thought=thought,
+                thought_number=thought_number,
+                total_thoughts=total_thoughts,
+                next_thought_needed=next_thought_needed,
+            )
+            return engine.process_plan_optimizer(
+                sid, data,
+                phase=phase,
+                plan_text=plan_text,
+                plan_context=plan_context,
+                dimension=dimension,
+                score=score,
+                issue=issue,
+                variant_label=variant_label,
+                variant_name=variant_name,
+                variant_summary=variant_summary,
+                variant_approach=variant_approach,
+                variant_pros=variant_pros,
+                variant_cons=variant_cons,
+                variant_risk_level=variant_risk_level,
+                variant_complexity=variant_complexity,
+                recommendation=recommendation,
+                winner_label=winner_label,
+                effort_mode=effort_mode,
+            )
+        except Exception as e:
+            return PlanOptimizerResult(
+                success=False,
+                message=f"Plan optimizer failed: {e!s}",
             )

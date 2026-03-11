@@ -808,3 +808,207 @@ def register_filesystem_tools(mcp: FastMCP) -> None:
             return DirectoryTreeResult(success=False, message=str(ve))
         except Exception as e:
             return DirectoryTreeResult(success=False, message=f"Tree failed: {e!s}")
+
+
+# === Large write support ===
+
+# In-memory buffers for chunked writes, keyed by session_id
+_large_write_buffers: dict[str, dict] = {}
+
+MAX_LARGE_WRITE_BYTES = 5_242_880  # 5 MB total limit per session
+
+
+class LargeWriteResult(BaseModel):
+    """Result from large_write tool."""
+
+    success: bool
+    session_id: str = ""
+    path: str = ""
+    action: str = ""
+    chunks_received: int = 0
+    total_bytes: int = 0
+    bytes_written: int = 0
+    created: bool = False
+    message: str | None = None
+
+
+def _large_write_start(
+    session_id: str, path: str,
+) -> None:
+    """Start a new large write session."""
+    _large_write_buffers[session_id] = {
+        "path": path,
+        "chunks": [],
+        "total_bytes": 0,
+    }
+
+
+def _large_write_append(
+    session_id: str, content: str,
+) -> int:
+    """Append content to a large write session. Returns new total bytes."""
+    buf = _large_write_buffers[session_id]
+    chunk_bytes = len(content.encode("utf-8"))
+    new_total = buf["total_bytes"] + chunk_bytes
+    if new_total > MAX_LARGE_WRITE_BYTES:
+        msg = (
+            f"Content exceeds max size ({MAX_LARGE_WRITE_BYTES} bytes)."
+            f" Current: {buf['total_bytes']}, chunk: {chunk_bytes}"
+        )
+        raise ValueError(msg)
+    buf["chunks"].append(content)
+    buf["total_bytes"] = new_total
+    return new_total
+
+
+def _large_write_finalize(
+    session_id: str,
+) -> tuple[str, int, bool]:
+    """Finalize and write the buffered content.
+
+    Returns (path, bytes_written, created).
+    """
+    buf = _large_write_buffers.pop(session_id)
+    path_str = buf["path"]
+    full_content = "".join(buf["chunks"])
+    resolved = _safe_resolve(path_str)
+    created = not resolved.exists()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(full_content, encoding="utf-8")
+    return path_str, buf["total_bytes"], created
+
+
+def register_large_write_tool(mcp: FastMCP) -> None:
+    """Register the large_write tool on the MCP server."""
+
+    @mcp.tool(
+        name="large_write",
+        description=(
+            "Write large files in chunks when content is too big for"
+            " a single write_file call."
+            " Use action='start' to begin a session with a file path,"
+            " then 'append' to add content in pieces,"
+            " then 'finalize' to write the assembled file to disk."
+            " Supports up to 5 MB total. Each session is identified"
+            " by a session_id you provide."
+            "\n\nWorkflow:"
+            "\n1. large_write(action='start', session_id='s1',"
+            "    path='src/big_file.py')"
+            "\n2. large_write(action='append', session_id='s1',"
+            "    content='first chunk...')"
+            "\n3. large_write(action='append', session_id='s1',"
+            "    content='second chunk...')"
+            "\n4. large_write(action='finalize', session_id='s1')"
+        ),
+    )
+    async def large_write(
+        action: str = Field(
+            description=(
+                "Action: 'start' to begin, 'append' to add content,"
+                " 'finalize' to write to disk, 'abort' to cancel."
+            ),
+        ),
+        session_id: str = Field(
+            description="Unique session identifier for this write.",
+        ),
+        path: str = Field(
+            default="",
+            description=(
+                "Relative file path. Required for 'start' action."
+                " Example: 'src/utils/big_module.py'"
+            ),
+        ),
+        content: str = Field(
+            default="",
+            description=(
+                "Content chunk to append. Used with 'append' action."
+            ),
+        ),
+    ) -> LargeWriteResult:
+        """Write large files in chunks."""
+        try:
+            if action == "start":
+                if not path:
+                    return LargeWriteResult(
+                        success=False, action=action,
+                        session_id=session_id,
+                        message="path is required for 'start' action",
+                    )
+                # Validate path early
+                _safe_resolve(path)
+                _large_write_start(session_id, path)
+                return LargeWriteResult(
+                    success=True, action=action,
+                    session_id=session_id, path=path,
+                    chunks_received=0, total_bytes=0,
+                )
+
+            if action == "append":
+                if session_id not in _large_write_buffers:
+                    return LargeWriteResult(
+                        success=False, action=action,
+                        session_id=session_id,
+                        message=f"No active session '{session_id}'."
+                        " Call with action='start' first.",
+                    )
+                if not content:
+                    return LargeWriteResult(
+                        success=False, action=action,
+                        session_id=session_id,
+                        message="content is required for 'append'",
+                    )
+                total = _large_write_append(session_id, content)
+                buf = _large_write_buffers[session_id]
+                return LargeWriteResult(
+                    success=True, action=action,
+                    session_id=session_id,
+                    path=buf["path"],
+                    chunks_received=len(buf["chunks"]),
+                    total_bytes=total,
+                )
+
+            if action == "finalize":
+                if session_id not in _large_write_buffers:
+                    return LargeWriteResult(
+                        success=False, action=action,
+                        session_id=session_id,
+                        message=f"No active session '{session_id}'",
+                    )
+                fpath, written, created = _large_write_finalize(
+                    session_id,
+                )
+                return LargeWriteResult(
+                    success=True, action=action,
+                    session_id=session_id,
+                    path=fpath, bytes_written=written,
+                    created=created,
+                )
+
+            if action == "abort":
+                _large_write_buffers.pop(session_id, None)
+                return LargeWriteResult(
+                    success=True, action=action,
+                    session_id=session_id,
+                    message="Session aborted",
+                )
+
+            return LargeWriteResult(
+                success=False, action=action,
+                session_id=session_id,
+                message=(
+                    f"Invalid action '{action}'."
+                    " Must be 'start', 'append',"
+                    " 'finalize', or 'abort'."
+                ),
+            )
+        except ValueError as ve:
+            return LargeWriteResult(
+                success=False, action=action,
+                session_id=session_id, message=str(ve),
+            )
+        except Exception as e:
+            return LargeWriteResult(
+                success=False, action=action,
+                session_id=session_id,
+                message=f"large_write failed: {e!s}",
+            )
