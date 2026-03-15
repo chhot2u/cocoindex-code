@@ -2,15 +2,21 @@
 
 import argparse
 import asyncio
+import logging
+import sys
 
 import cocoindex as coco
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from .code_intelligence_tools import register_code_intelligence_tools
 from .config import config
+from .filesystem_tools import register_filesystem_tools, register_large_write_tool
 from .indexer import app as indexer_app
+from .patch_tools import register_patch_tools
 from .query import query_codebase
 from .shared import SQLITE_DB
+from .thinking_tools import register_thinking_tools
 
 # Initialize MCP server
 mcp = FastMCP(
@@ -24,8 +30,46 @@ mcp = FastMCP(
         "Provides semantic search that understands meaning --"
         " unlike grep or text matching,"
         " it finds relevant code even when exact keywords are unknown."
+        "\n\n"
+        "Fast filesystem tools:"
+        "\n- find_files: fast glob-based file discovery"
+        "\n- read_file: read file contents with line ranges"
+        "\n- write_file: write/create files instantly"
+        "\n- edit_file: exact string replacement in files"
+        "\n- grep_code: regex text search across files"
+        "\n- directory_tree: list project structure"
+        "\n- large_write: write large files in chunks"
+        "\n\n"
+        "Code intelligence tools:"
+        "\n- list_symbols: list functions, classes, methods in a file"
+        "\n- find_definition: go-to-definition across the codebase"
+        "\n- find_references: find all usages of a symbol"
+        "\n- code_metrics: code quality metrics for a file"
+        "\n- rename_symbol: safe codebase-wide rename"
+        "\n\n"
+        "Patch tools:"
+        "\n- apply_patch: apply unified diff patches to files"
+        "\n\n"
+        "Advanced thinking and reasoning tools:"
+        "\n- sequential_thinking: step-by-step problem solving"
+        "\n- extended_thinking: deep analysis with checkpoints"
+        "\n- ultra_thinking: maximum-depth reasoning"
+        "\n- evidence_tracker: attach weighted evidence to hypotheses"
+        "\n- premortem: structured pre-failure risk analysis"
+        "\n- inversion_thinking: guarantee-failure-then-invert reasoning"
+        "\n- effort_estimator: three-point PERT estimation"
+        "\n- learning_loop: reflect on sessions and extract learnings"
+        "\n- self_improve: get strategy recommendations"
+        "\n- reward_thinking: provide reinforcement signals"
+        "\n- plan_optimizer: analyze, score, and optimize any plan"
     ),
 )
+
+register_filesystem_tools(mcp)
+register_large_write_tool(mcp)
+register_code_intelligence_tools(mcp)
+register_patch_tools(mcp)
+register_thinking_tools(mcp)
 
 # Lock to prevent concurrent index updates
 _index_lock = asyncio.Lock()
@@ -167,8 +211,10 @@ async def search(
 
 async def _async_serve() -> None:
     """Async entry point for the MCP server."""
-    # Refresh index in background so startup isn't blocked
-    asyncio.create_task(_refresh_index())
+    # Index refresh is deferred to first search call.
+    # Starting it here can crash the stdio transport if the
+    # background task raises or writes to stdout/stderr before
+    # the MCP handshake completes.
     await mcp.run_stdio_async()
 
 
@@ -209,6 +255,8 @@ async def _print_index_stats() -> None:
 
 def main() -> None:
     """Entry point for the cocoindex-code CLI."""
+    # Ensure all logging goes to stderr, never stdout (MCP uses stdout for JSON-RPC)
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
     parser = argparse.ArgumentParser(
         prog="cocoindex-code",
         description="MCP server for codebase indexing and querying.",
